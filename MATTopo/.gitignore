@@ -1,0 +1,9 @@
+*build*/*
+extern/polyscope*
+extern/.*
+extern/libmat*
+extern/geogram*
+.vscode*
+houdini*/*
+out*/*
+
