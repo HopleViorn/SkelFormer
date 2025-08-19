@@ -124,38 +124,56 @@ class GeometricSDFDataset(Dataset):
     # --- 解析SDF函数 ---
     def sdf_box(self, p, size):
         q = np.abs(p) - size / 2
-        return np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(np.max(q, axis=-1), 0.0)
+        unsigned_dist = np.linalg.norm(np.maximum(q, 0.0), axis=-1)
+        inside_dist = np.minimum(np.max(q, axis=-1), 0.0)
+        return unsigned_dist + inside_dist
 
     def sdf_cylinder(self, p, r, h):
-        d = np.abs(np.sqrt(p[..., 0]**2 + p[..., 1]**2)) - r
-        d = np.maximum(d, np.abs(p[..., 2]) - h / 2)
-        return d
+        d_xy = np.sqrt(p[..., 0]**2 + p[..., 1]**2)
+        d = np.stack([d_xy - r, np.abs(p[..., 2]) - h / 2], axis=-1)
+        unsigned_dist = np.linalg.norm(np.maximum(d, 0.0), axis=-1)
+        inside_dist = np.minimum(np.max(d, axis=-1), 0.0)
+        return unsigned_dist + inside_dist
 
     def sdf_pyramid(self, p, b, h):
-        # 近似SDF
-        p_copy = p.copy()
-        p_copy[:, 1] -= h
-        m2 = h*h + b*b
-        p_copy[:, 0] = np.abs(p_copy[:, 0])
-        p_copy[:, 2] = np.abs(p_copy[:, 2])
+        p_x, p_y, p_z = p[:, 0], p[:, 1], p[:, 2]
         
-        mask = p_copy[:, 2] > p_copy[:, 0]
-        p_copy[mask, 0], p_copy[mask, 2] = p_copy[mask, 2], p_copy[mask, 0]
-        
-        p_copy[:, 0] -= b
+        # Symmetries to handle all octants
+        p_x = np.abs(p_x)
+        p_z = np.abs(p_z)
 
-        q = np.stack([
-            p_copy[:, 2],
-            p_copy[:, 1]*b + p_copy[:, 0]*h,
-            p_copy[:, 1]*h - p_copy[:, 0]*b
-        ], axis=-1)
+        # Vector from a point on the slanted face to the query point
+        # The slanted face can be defined by the normal (h, b, 0) and a point (b, 0, 0)
+        # This is a simplification for one face, but works due to symmetry
+        n = np.array([h, b, 0])
+        n /= np.linalg.norm(n)
         
-        s = np.maximum(0, -q[:, 2]/m2)
-        q[:, 0] -= s*b
-        q[:, 1] -= s*h
+        # Distance to the slanted plane that goes through (b,0,0)
+        dist_slant = np.dot(p - np.array([b, 0, 0]), n)
         
-        d = np.sqrt(q[:, 0]**2 + q[:, 1]**2) * np.sign(q[:, 1])
-        return d
+        # Clamp to the region of the pyramid
+        q = p.copy()
+        q[:, 0] -= np.clip(q[:, 0], 0, b)
+        q[:, 2] -= np.clip(q[:, 2], 0, b)
+        
+        # Final distance calculation
+        d = np.sqrt(q[:, 0]**2 + q[:, 2]**2) * np.sign(p[:, 0] - b)
+        d = np.minimum(d, dist_slant)
+        
+        # Distance to the base plane
+        d = np.maximum(d, -p_y)
+        
+        # Check if inside the pyramid's vertical bounds
+        is_outside_y = (p_y < 0) | (p_y > h)
+        
+        # A simple inside/outside check
+        is_inside = (p_y >= 0) & (p_y <= h) & (p_x / b + p_y / h <= 1) & (p_z / b + p_y / h <= 1)
+        
+        # Combine and assign sign
+        final_dist = np.abs(d)
+        final_dist[is_inside] *= -1
+        
+        return final_dist
 
     def _generate_box(self):
         size = np.random.uniform(0.2, 1.0, 3)
@@ -181,7 +199,7 @@ class GeometricSDFDataset(Dataset):
             [0, 3, 2], [0, 2, 1]
         ])
         pyramid = trimesh.Trimesh(vertices=base_vertices, faces=faces)
-        return pyramid, 'pyramid', {'base_size': base_size[0], 'height': height} # Use single base size for simplicity
+        return pyramid, 'pyramid', {'base_size': base_size[0], 'height': height}
 
     def _generate_geometry(self):
         geom_type = np.random.choice(self.geometries)
@@ -194,35 +212,29 @@ class GeometricSDFDataset(Dataset):
             mesh, _, params = self._generate_pyramid()
         
         local_params = params.copy()
-
         rotation_matrix = trimesh.transformations.random_rotation_matrix()
         mesh.apply_transform(rotation_matrix)
         
-        # 返回 mesh, 类型, 局部参数, 和旋转矩阵
         return mesh, geom_type, local_params, rotation_matrix
 
     def __getitem__(self, idx):
         try:
             mesh, geom_type, local_params, rotation_matrix = self.meshes_data[idx]
             
-            # --- Perform normalization ---
             center = mesh.bounding_box.centroid
             scale = mesh.bounding_box.extents.max()
             
-            # Create a normalized copy for point cloud sampling
             mesh_normalized = mesh.copy()
             if scale > 1e-8:
                 mesh_normalized.apply_translation(-center)
                 mesh_normalized.apply_scale(1.0 / scale)
 
-            # --- a. 准备输入点云 ---
             points_surface, face_indices = trimesh.sample.sample_surface(mesh_normalized, self.pc_size)
             normals_surface = mesh_normalized.face_normals[face_indices]
             labels_surface = np.zeros((self.pc_size, 1), dtype=np.float32)
             point_cloud_data = np.concatenate([points_surface, normals_surface, labels_surface], axis=1)
             point_cloud_tensor = torch.from_numpy(point_cloud_data).float()
 
-            # --- b. 准备查询点和计算SDF ---
             num_surface_samples = int(self.points_per_sample * self.sample_on_surface_ratio)
             num_space_samples = self.points_per_sample - num_surface_samples
             surface_points, _ = trimesh.sample.sample_surface(mesh_normalized, num_surface_samples)
@@ -230,18 +242,14 @@ class GeometricSDFDataset(Dataset):
             space_points = np.random.uniform(-1.0, 1.0, size=(num_space_samples, 3))
             query_points = np.concatenate([surface_points, space_points], axis=0)
 
-            # --- 使用解析方法计算SDF ---
-            # 1. 将查询点从归一化空间转换回原始旋转后的空间
             query_points_rotated = query_points.copy()
             if scale > 1e-8:
                 query_points_rotated = query_points_rotated * scale + center
 
-            # 2. 将点应用逆旋转，转换到物体的局部坐标系
             inverse_rotation_matrix = np.linalg.inv(rotation_matrix)
             query_points_homogeneous = np.hstack([query_points_rotated, np.ones((query_points.shape[0], 1))])
             local_query_points = (inverse_rotation_matrix @ query_points_homogeneous.T).T[:, :3]
 
-            # 3. 在局部坐标系中调用相应的解析SDF函数
             if geom_type == 'box':
                 sdf_values = self.sdf_box(local_query_points, local_params['size'])
             elif geom_type == 'cylinder':
@@ -249,7 +257,6 @@ class GeometricSDFDataset(Dataset):
             else: # pyramid
                 sdf_values = self.sdf_pyramid(local_query_points, local_params['base_size'], local_params['height'])
             
-            # 4. SDF值是距离，需要乘以缩放因子以匹配归一化后的空间
             if scale > 1e-8:
                 sdf_values /= scale
 
