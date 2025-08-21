@@ -112,11 +112,16 @@ class GeometricSDFDataset(Dataset):
         self.sample_on_surface_ratio = sample_on_surface_ratio
         self.meshes_data = []
         
-        self.geometries = ['box', 'cylinder', 'pyramid']
-        print(f"正在预生成 {num_samples} 个带随机旋转的几何体样本...")
+        self.geometries = ['box', 'cylinder']
+        self.regenerate()
+
+    def regenerate(self):
+        """清空并重新生成所有几何体样本"""
+        print(f"正在重新生成 {self.num_samples} 个带随机旋转的几何体样本...")
+        self.meshes_data = []
         for _ in range(self.num_samples):
             self.meshes_data.append(self._generate_geometry())
-        print("几何体预生成完成。")
+        print("几何体重新生成完成。")
 
     def __len__(self):
         return len(self.meshes_data)
@@ -212,8 +217,10 @@ class GeometricSDFDataset(Dataset):
             mesh, _, params = self._generate_pyramid()
         
         local_params = params.copy()
-        rotation_matrix = trimesh.transformations.random_rotation_matrix()
-        mesh.apply_transform(rotation_matrix)
+        # 禁用旋转
+        # rotation_matrix = trimesh.transformations.random_rotation_matrix()
+        # mesh.apply_transform(rotation_matrix)
+        rotation_matrix = np.eye(4)  # 使用单位矩阵作为"无旋转"
         
         return mesh, geom_type, local_params, rotation_matrix
 

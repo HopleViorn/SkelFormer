@@ -17,8 +17,11 @@ from sdf_dataset import load_single_geometric_sample
 def visualize_sdf_from_geometric_sample(
     model_path="skelformer_sdf.pth",
     pc_size=81920,
-    grid_resolution=64,
-    mc_level=0.0
+    grid_resolution=128,
+    mc_level=0.0,
+    num_slices_x=1,
+    num_slices_y=1,
+    num_slices_z=1
 ):
     """
     从一个程序化生成的几何体样本加载模型，预测SDF，并可视化结果。
@@ -59,7 +62,7 @@ def visualize_sdf_from_geometric_sample(
 
         # --- 4. 生成查询点网格以可视化SDF ---
         print(f"正在生成 {grid_resolution}^3 的查询点网格...")
-        grid_min, grid_max = -0.5, 0.5
+        grid_min, grid_max = -0.51, 0.51
         x = torch.linspace(grid_min, grid_max, grid_resolution)
         y = torch.linspace(grid_min, grid_max, grid_resolution)
         z = torch.linspace(grid_min, grid_max, grid_resolution)
@@ -91,6 +94,11 @@ def visualize_sdf_from_geometric_sample(
         
         sdf_grid = torch.cat(sdf_values, dim=0).reshape(grid_resolution, grid_resolution, grid_resolution).numpy()
         print("SDF值预测完成。")
+        print(f"预测的SDF值范围: [{sdf_grid.min():.4f}, {sdf_grid.max():.4f}]")
+        # 检查是否有负值
+        num_negative = np.sum(sdf_grid < 0)
+        num_positive = np.sum(sdf_grid > 0)
+        print(f"负值数量: {num_negative}, 正值数量: {num_positive}")
 
     # --- 6. 使用 Marching Cubes 从SDF场提取网格 ---
     print(f"正在使用 Marching Cubes 提取网格 (level={mc_level})...")
@@ -122,24 +130,73 @@ def visualize_sdf_from_geometric_sample(
     # if sdf_mesh and sdf_mesh.vertices.shape[0] > 0:
     #     v.add_mesh("Reconstructed SDF Mesh", sdf_mesh.vertices, sdf_mesh.faces, color=np.array([0, 255, 0]))
 
-    # 可视化SDF切片
-    slice_index = grid_resolution // 2
-    sdf_slice = sdf_grid[:, slice_index, :]
+    # --- 8. 可视化SDF切片 ---
+    grid_min, grid_max = -0.5, 0.5
     
-    # 将SDF值映射到颜色 (红 -> 负, 蓝 -> 正)
-    colors = np.zeros((grid_resolution, grid_resolution, 3), dtype=np.uint8)
-    sdf_normalized = (sdf_slice - sdf_slice.min()) / (sdf_slice.max() - sdf_slice.min() + 1e-9)
-    colors[..., 0] = (1 - sdf_normalized) * 255 # 红色通道
-    colors[..., 2] = sdf_normalized * 255       # 蓝色通道
-    
-    slice_coords = np.array(np.meshgrid(
-        np.linspace(grid_min, grid_max, grid_resolution),
-        np.linspace(grid_min, grid_max, grid_resolution)
-    )).T.reshape(-1, 2)
-    
-    slice_points = np.insert(slice_coords, 1, grid_min + slice_index * (grid_max - grid_min) / grid_resolution, axis=1)
+    def get_slice_colors(sdf_slice):
+        """根据SDF值计算颜色，负值为红色，正值为蓝色。"""
+        colors = np.zeros((sdf_slice.shape[0], sdf_slice.shape[1], 3), dtype=np.uint8)
+        # 找到SDF绝对值的最大值用于归一化
+        max_abs_val = np.max(np.abs(sdf_slice)) + 1e-9
 
-    v.add_points("SDF Slice", slice_points, colors=colors.reshape(-1, 3), point_size=30)
+        print(sdf_slice[32-10:32+10,32-10:32+10])
+
+        
+        # 负值 (内部): 从红色 (SDF值最小) 到 白色 (SDF值接近0)
+        neg_mask = sdf_slice < 0
+        if np.any(neg_mask):
+            neg_vals = -sdf_slice[neg_mask] / max_abs_val # 归一化到 [0, 1]
+            colors[neg_mask, 0] = 255  # R=255
+            colors[neg_mask, 1] = 255 * (1 - neg_vals) # G
+            colors[neg_mask, 2] = 255 * (1 - neg_vals) # B
+
+        # 正值 (外部): 从蓝色 (SDF值最大) 到 白色 (SDF值接近0)
+        pos_mask = sdf_slice >= 0
+        if np.any(pos_mask):
+            pos_vals = sdf_slice[pos_mask] / max_abs_val # 归一化到 [0, 1]
+            colors[pos_mask, 2] = 255 # B=255
+            colors[pos_mask, 0] = 255 * (1 - pos_vals) # R
+            colors[pos_mask, 1] = 255 * (1 - pos_vals) # G
+        return colors.reshape(-1, 3)
+
+    # 可视化 YZ 平面上的切片 (沿 X 轴)
+    for i in range(num_slices_x):
+        slice_index = int((i + 1) * (grid_resolution / (num_slices_x + 1)))
+        if slice_index >= grid_resolution: continue
+        sdf_slice = sdf_grid[slice_index, :, :]
+        colors = get_slice_colors(sdf_slice)
+        coords = np.array(np.meshgrid(
+            np.linspace(grid_min, grid_max, grid_resolution),
+            np.linspace(grid_min, grid_max, grid_resolution)
+        )).T.reshape(-1, 2)
+        slice_points = np.insert(coords, 0, grid_min + slice_index * (grid_max - grid_min) / grid_resolution, axis=1)
+        v.add_points(f"SDF Slice X-{i+1}", slice_points, colors=colors, point_size=30)
+
+    # 可视化 XZ 平面上的切片 (沿 Y 轴)
+    for i in range(num_slices_y):
+        slice_index = int((i + 1) * (grid_resolution / (num_slices_y + 1)))
+        if slice_index >= grid_resolution: continue
+        sdf_slice = sdf_grid[:, slice_index, :]
+        colors = get_slice_colors(sdf_slice)
+        coords = np.array(np.meshgrid(
+            np.linspace(grid_min, grid_max, grid_resolution),
+            np.linspace(grid_min, grid_max, grid_resolution)
+        )).T.reshape(-1, 2)
+        slice_points = np.insert(coords, 1, grid_min + slice_index * (grid_max - grid_min) / grid_resolution, axis=1)
+        v.add_points(f"SDF Slice Y-{i+1}", slice_points, colors=colors, point_size=30)
+
+    # 可视化 XY 平面上的切片 (沿 Z 轴)
+    for i in range(num_slices_z):
+        slice_index = int((i + 1) * (grid_resolution / (num_slices_z + 1)))
+        if slice_index >= grid_resolution: continue
+        sdf_slice = sdf_grid[:, :, slice_index]
+        colors = get_slice_colors(sdf_slice)
+        coords = np.array(np.meshgrid(
+            np.linspace(grid_min, grid_max, grid_resolution),
+            np.linspace(grid_min, grid_max, grid_resolution)
+        )).T.reshape(-1, 2)
+        slice_points = np.insert(coords, 2, grid_min + slice_index * (grid_max - grid_min) / grid_resolution, axis=1)
+        v.add_points(f"SDF Slice Z-{i+1}", slice_points, colors=colors, point_size=30)
 
     viz_path = "sdf_visualization"
     v.save(viz_path)
@@ -153,4 +210,5 @@ def visualize_sdf_from_geometric_sample(
 
 
 if __name__ == "__main__":
-    visualize_sdf_from_geometric_sample()
+    # 示例：在每个轴上可视化2个切片
+    visualize_sdf_from_geometric_sample(num_slices_x=3, num_slices_y=3, num_slices_z=3)
